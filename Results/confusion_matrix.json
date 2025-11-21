@@ -1,0 +1,15 @@
+{
+  "confusion_matrix": [
+    [
+      1893
+    ]
+  ],
+  "confusion_matrix_normalized": [
+    [
+      0.9999999994717379
+    ]
+  ],
+  "classes": [
+    "whitefly"
+  ]
+}

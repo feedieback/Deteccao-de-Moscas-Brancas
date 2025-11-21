@@ -1,0 +1,21 @@
+{
+  "model": "pest_detection_ip102\\train_yolov8n\\weights\\last.pt",
+  "dataset": "C:\\Users\\Victor\\Documents\\TCC\\IA\\datasets\\ip102_yolo_white_fly\\ip102.yaml",
+  "num_classes": 1,
+  "timestamp": "2025-11-20T19:43:20.786940",
+  "metrics": {
+    "precision": 0.8960980286407124,
+    "recall": 0.6793449550977285,
+    "mAP50": 0.7546126290052504,
+    "mAP50_95": 0.473395020214565,
+    "fitness": 0.473395020214565
+  },
+  "per_class": {
+    "whitefly": {
+      "precision": 0.8960980286407124,
+      "recall": 0.6793449550977285,
+      "AP50": 0.7546126290052504,
+      "AP": 0.473395020214565
+    }
+  }
+}
