@@ -1,409 +1,480 @@
 # -*- coding: utf-8 -*-
 """
-Treinador YOLO otimizado para detecção de MOSCA-BRANCA (whitefly)
+Whitefly Auto-Labeler V3
+------------------------
 
-Características:
-- Mantém o caminho do YAML conforme fornecido (não modificado)
-- Verifica/convete labels para 1 classe (0 = whitefly) automaticamente com backup
-- Cria val set (split) se estiver ausente
-- Parâmetros otimizados para objetos pequenos (imgsz=640, mosaic elevado, FP16)
-- Tenta recuperar de OOM reduzindo batch automaticamente
+Versão aprimorada do gerador automático de labels para mosca-branca.
+Esta versão utiliza múltiplas etapas de pré-processamento e heurísticas
+morfológicas para identificar insetos mesmo em imagens ruidosas ou com
+variações fortes de iluminação.
+
+Recursos incluídos:
+ - Pré-processamento com CLAHE, redução de ruído e suavização.
+ - Três faixas HSV independentes para detectar adultos, ninfas e fallback.
+ - Extração de regiões usando máscara de cor combinada com bordas (Canny),
+   reduzindo falsos positivos originados da textura da folha.
+ - Avaliação dos candidatos por um score multi-critério
+   (área, circularidade, aspecto, solidez, preenchimento etc.).
+ - Non-Max Suppression simples para remover caixas sobrepostas.
+ - Geração de labels YOLO (.txt) com coordenadas normalizadas.
+ - Sistema opcional de visualização de amostras detectadas.
 """
 
-import os
-import shutil
-import sys
-import time
+import cv2
+import numpy as np
 from pathlib import Path
+import json
+from tqdm import tqdm
+import shutil
 from datetime import datetime
-import random
+from typing import List, Dict, Tuple, Optional
 
-# evitar erro OpenMP múltiplo no Windows
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
+# ------------------------------------------------------------
+# Parâmetros principais de operação do modelo
+# ------------------------------------------------------------
 
-from ultralytics import YOLO
-import torch
-import yaml
+# Limiar mínimo para que uma detecção seja aceita.
+# Valores menores aumentam recall, mas também aumentam falsos positivos.
+DEFAULT_CONFIDENCE = 0.55
 
-# -------------- CONFIGURÁVEIS --------------
-# Mantenha este caminho exatamente como seu YAML correto
-DATASET_YAML_PATH = Path(r"C:\Users\Victor\Documents\TCC\IA\datasets\ip102_yolo_white_fly\ip102.yaml")
-
-# Índice original da mosca-branca no seu dataset IP102 (mudar se necessário)
-TARGET_ORIG_CLASS = 5   # geralmente 5 = Trialeurodes_vaporariorum no IP102
-
-# Backup das labels originais será criado aqui
-BACKUP_DIR = Path(r"C:\Users\Victor\Documents\TCC\IA\datasets\ip102_yolo_white_fly\labels")
-
-# Hyperparams
-DEFAULT_MODEL = "yolov8s"   # sugerido para objetos pequenos (pode usar 'yolov8n' se preferir)
-DEFAULT_PROJECT = "whitefly_detection_opt"
-MAX_RETRIES_ON_OOM = 2
-# -------------------------------------------
+# Quantidade de imagens por split a serem salvas como amostras visuais.
+VIS_SAMPLES_PER_SPLIT = 12
 
 
-def read_yaml(path: Path):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def write_yaml(path: Path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f)
-
-
-def ensure_label_backup(dataset_root: Path):
-    """Cria backup (apenas uma vez) das labels originais antes de qualquer modificação."""
-    if BACKUP_DIR.exists():
-        print(f"Backup já existe em: {BACKUP_DIR}")
-        return
-    print(f"Criando backup das labels em: {BACKUP_DIR} ...")
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    orig_labels = dataset_root / "labels"
-    if not orig_labels.exists():
-        print("Pasta de labels original não encontrada; nada a copiar.")
-        return
-    shutil.copytree(orig_labels, BACKUP_DIR / "labels", dirs_exist_ok=True)
-    print("Backup criado.")
-
-
-def convert_labels_to_single_class(dataset_root: Path, target_orig_class: int = TARGET_ORIG_CLASS):
+class WhiteflyAutoLabelerV3:
     """
-    Percorre labels em train/val/test e:
-    - Mantém apenas as linhas cuja classe == target_orig_class
-    - Reescreve essas linhas trocando a classe para 0
-    - Remove arquivos de label vazios resultantes
-    - Copia apenas imagens que tiveram labels mantidos
+    Classe responsável por todo o pipeline de geração automática de labels.
+    Realiza desde o pré-processamento até a criação final dos arquivos YOLO.
     """
 
-    images_root = dataset_root / "images"
-    labels_root = dataset_root / "labels"
+    def __init__(self, confidence_threshold: float = DEFAULT_CONFIDENCE, debug: bool = False):
+        self.confidence_threshold = float(confidence_threshold)
+        self.debug = debug
 
-    if not labels_root.exists():
-        print("Pasta de labels não encontrada:", labels_root)
-        return
+        # Faixas HSV definidas com base no dataset real.
+        # Cada faixa representa um tipo de inseto e possui seu próprio limite de área
+        # e peso no cálculo do score final.
+        self.stages = {
+            'adulto': {
+                'hsv_lower': np.array([18, 20, 150], dtype=np.uint8),
+                'hsv_upper': np.array([42, 160, 255], dtype=np.uint8),
+                'min_area': 30,
+                'max_area': 3000,
+                'weight': 1.0
+            },
+            'ninfa': {
+                'hsv_lower': np.array([22, 60, 120], dtype=np.uint8),
+                'hsv_upper': np.array([65, 255, 255], dtype=np.uint8),
+                'min_area': 10,
+                'max_area': 1600,
+                'weight': 0.95
+            },
+            'geral': {
+                'hsv_lower': np.array([0, 0, 180], dtype=np.uint8),
+                'hsv_upper': np.array([85, 255, 255], dtype=np.uint8),
+                'min_area': 8,
+                'max_area': 4000,
+                'weight': 0.8
+            }
+        }
 
-    print("Convertendo labels para classe única (0 = whitefly).")
-    ensure_label_backup(dataset_root)
+        # Faixa aproximada da cor da folha, usada apenas como referência contextual.
+        self.leaf_hsv_lower = np.array([30, 25, 30], dtype=np.uint8)
+        self.leaf_hsv_upper = np.array([90, 255, 255], dtype=np.uint8)
 
-    kept = 0
-    removed = 0
-    for split in ("train", "val", "test"):
-        lbl_dir = labels_root / split
-        img_dir = images_root / split
-        if not lbl_dir.exists():
-            continue
-        for txt_path in list(lbl_dir.rglob("*.txt")):
-            try:
-                lines = txt_path.read_text(encoding="utf-8").splitlines()
-            except Exception:
-                lines = []
-            new_lines = []
-            for L in lines:
-                parts = L.strip().split()
-                if len(parts) < 5:
+        print("="*70)
+        print("WHITEFLY AUTO-LABELER V3")
+        print("="*70)
+        print(f"Confidence threshold: {self.confidence_threshold}")
+        print(f"Debug: {self.debug}")
+        print("Stages:", ", ".join(self.stages.keys()))
+
+    # ----------------------------------------------------------------------
+    # Pré-processamento da imagem
+    # ----------------------------------------------------------------------
+    def _preprocess(self, img: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        Executa o pré-processamento da imagem para estabilizar a detecção:
+        - Aumenta levemente imagens pequenas (consistência do pipeline).
+        - Aplica CLAHE para melhorar contraste.
+        - Reduz ruído preservando detalhes.
+        - Suaviza a imagem para eliminar ruído fino.
+        - Converte para HSV, grayscale e extrai bordas via Canny.
+        """
+        h, w = img.shape[:2]
+        scale = 1.0
+
+        if max(h, w) < 600:
+            scale = 1.5
+            img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_LINEAR)
+
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(l)
+        enhanced = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+        denoised = cv2.fastNlMeansDenoisingColored(enhanced, None, 9, 9, 7, 21)
+
+        blurred = cv2.GaussianBlur(denoised, (3,3), 0)
+
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+
+        return {
+            'orig': img,
+            'enhanced': enhanced,
+            'denoised': denoised,
+            'blurred': blurred,
+            'hsv': hsv,
+            'gray': gray,
+            'edges': edges,
+            'scale': scale
+        }
+
+    # ----------------------------------------------------------------------
+    # Construção da máscara segmentada por estágio HSV
+    # ----------------------------------------------------------------------
+    def _stage_mask(self, hsv: np.ndarray, stage_name: str) -> np.ndarray:
+        """
+        Gera a máscara binária correspondente a um estágio (adulto, ninfa ou geral),
+        aplicando também operações morfológicas para reduzir ruído e pequenos artefatos.
+        """
+        s = self.stages[stage_name]
+        mask = cv2.inRange(hsv, s['hsv_lower'], s['hsv_upper'])
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        return mask
+
+    # ----------------------------------------------------------------------
+    # Extração de regiões candidatas com base em cor + bordas
+    # ----------------------------------------------------------------------
+    def _extract_candidates(self, pre: Dict[str, np.ndarray]) -> List[Dict]:
+        """
+        Localiza regiões possivelmente correspondentes a insetos combinando:
+        - Máscaras HSV específicas para cada estágio.
+        - Interseção com bordas (Canny) para eliminar manchas da folha.
+        - Fusão das máscaras para destacar regiões relevantes.
+        
+        Em seguida, contornos são filtrados por tamanho e atributos morfológicos.
+        """
+        hsv = pre['hsv']
+        edges = pre['edges']
+
+        candidates = []
+
+        for stage_name in self.stages.keys():
+            mask = self._stage_mask(hsv, stage_name)
+
+            edges_dil = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
+            mask_edges = cv2.bitwise_and(mask, mask, mask=edges_dil)
+
+            fused = cv2.bitwise_or(mask, mask_edges)
+
+            cnts, _ = cv2.findContours(fused, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            sconf = self.stages[stage_name]
+
+            for cnt in cnts:
+                area = cv2.contourArea(cnt)
+                if area < sconf['min_area'] or area > sconf['max_area']:
                     continue
-                try:
-                    cls = int(parts[0])
-                except:
+
+                x,y,w,h = cv2.boundingRect(cnt)
+
+                aspect = w / (h + 1e-6)
+                per = cv2.arcLength(cnt, True)
+                circularity = (4*np.pi*area / (per*per)) if per > 0 else 0
+                hull = cv2.convexHull(cnt)
+                hull_area = cv2.contourArea(hull) if hull is not None else 0
+                solidity = area / (hull_area + 1e-6)
+                extent = area / (w*h + 1e-6)
+                hu = cv2.HuMoments(cv2.moments(cnt)).flatten()
+                hu_score = 1.0/(1.0 + abs(hu[0]))
+
+                candidates.append({
+                    'stage': stage_name,
+                    'cnt': cnt,
+                    'bbox': [x,y,w,h],
+                    'area': area,
+                    'aspect': aspect,
+                    'circularity': circularity,
+                    'solidity': solidity,
+                    'extent': extent,
+                    'hu0': float(hu[0]),
+                    'hu_score': float(hu_score),
+                    'mask_mean': float(np.mean(mask[y:y+h, x:x+w]) / 255.0),
+                    'fused_mean': float(np.mean(fused[y:y+h, x:x+w]) / 255.0)
+                })
+
+        return candidates
+
+    # ----------------------------------------------------------------------
+    # Avaliação dos candidatos com score multi-critério
+    # ----------------------------------------------------------------------
+    def _score_candidate(self, cand: Dict, pre: Dict[str, np.ndarray]) -> float:
+        """
+        Calcula um score final usando múltiplos critérios:
+        - Área ideal do estágio.
+        - Solidez (insetos são compactos).
+        - Circularidade aproximada.
+        - Intensidade da máscara e fusão máscara+borda.
+        - Proporção do corpo (aspect ratio).
+        - Momento de Hu para forma.
+        - Peso específico do estágio.
+        """
+        sconf = self.stages[cand['stage']]
+        score = 0.0
+
+        ideal = (sconf['min_area'] + sconf['max_area'])/2.0
+        area_score = max(0.0, 1.0 - abs(cand['area'] - ideal)/ideal)
+        score += area_score * 0.30
+
+        score += min(1.0, cand['solidity']) * 0.18
+        score += min(1.0, cand['circularity'] * 2.0) * 0.15
+        score += cand['mask_mean'] * 0.12
+        score += cand['fused_mean'] * 0.10
+
+        aspect_ideal = 1.2
+        aspect_score = max(0.0, 1.0 - abs(cand['aspect'] - aspect_ideal)/aspect_ideal)
+        score += aspect_score * 0.10
+
+        score += min(1.0, cand['hu_score']) * 0.05
+
+        score *= sconf.get('weight', 1.0)
+
+        return float(np.clip(score, 0.0, 1.0))
+
+    # ----------------------------------------------------------------------
+    # Non-Max Suppression simples baseado em IoU
+    # ----------------------------------------------------------------------
+    def _nms(self, detections: List[Dict], iou_thres: float = 0.35) -> List[Dict]:
+        """
+        Aplica Non-Max Suppression (NMS) para remover caixas sobrepostas,
+        mantendo aquelas com maior score.
+        """
+        if not detections:
+            return []
+
+        dets = sorted(detections, key=lambda x: x['score'], reverse=True)
+        keep = []
+
+        for d in dets:
+            x1,y1,w1,h1 = d['bbox']
+            x1e, y1e = x1+w1, y1+h1
+            add = True
+
+            for k in keep:
+                x2,y2,w2,h2 = k['bbox']
+                x2e, y2e = x2+w2, y2+h2
+
+                xx1, yy1 = max(x1, x2), max(y1, y2)
+                xx2, yy2 = min(x1e, x2e), min(y1e, y2e)
+
+                if xx2 > xx1 and yy2 > yy1:
+                    inter = (xx2-xx1)*(yy2-yy1)
+                    union = w1*h1 + w2*h2 - inter
+                    iou = inter / (union + 1e-6)
+
+                    if iou > iou_thres:
+                        add = False
+                        break
+
+            if add:
+                keep.append(d)
+
+        return keep
+
+    # ----------------------------------------------------------------------
+    # Detecção completa em uma única imagem
+    # ----------------------------------------------------------------------
+    def detect_on_image(self, image_path: Path) -> List[Dict]:
+        """
+        Executa todas as etapas de detecção na imagem:
+         1. Pré-processamento
+         2. Extração de candidatos
+         3. Cálculo de score
+         4. Non-Max Suppression
+         5. Filtragem pelo limiar de confiança
+        """
+        img = cv2.imread(str(image_path))
+        if img is None:
+            return []
+
+        pre = self._preprocess(img)
+        candidates = self._extract_candidates(pre)
+
+        detections = []
+
+        for c in candidates:
+            score = self._score_candidate(c, pre)
+
+            if score >= (self.confidence_threshold * 0.4):
+                detections.append({
+                    'bbox': c['bbox'],
+                    'score': score,
+                    'stage': c['stage']
+                })
+
+        detections = self._nms(detections)
+        final = [d for d in detections if d['score'] >= self.confidence_threshold]
+
+        scale = pre.get('scale', 1.0)
+        if scale != 1.0:
+            for d in final:
+                x,y,w,h = d['bbox']
+                d['bbox'] = [int(x/scale), int(y/scale), int(w/scale), int(h/scale)]
+
+        return final
+
+    # ----------------------------------------------------------------------
+    # Conversão para o formato YOLO
+    # ----------------------------------------------------------------------
+    def to_yolo_lines(self, dets: List[Dict], img_w: int, img_h: int) -> List[str]:
+        """
+        Converte as detecções para o formato YOLO:
+        classe cx cy w h (todos normalizados entre 0 e 1).
+        Neste dataset, há apenas a classe 0 (mosca-branca).
+        """
+        lines = []
+        for d in dets:
+            x,y,w,h = d['bbox']
+            cx = (x + w/2) / img_w
+            cy = (y + h/2) / img_h
+            ww = w / img_w
+            hh = h / img_h
+            lines.append(f"0 {cx:.6f} {cy:.6f} {ww:.6f} {hh:.6f}")
+        return lines
+
+    # ----------------------------------------------------------------------
+    # Visualização das detecções em um arquivo .jpg
+    # ----------------------------------------------------------------------
+    def visualize(self, src_img_path: Path, detections: List[Dict], out_path: Path):
+        """
+        Gera uma imagem com as detecções desenhadas (bounding boxes)
+        para inspeção manual. A cor da caixa representa a confiança.
+        """
+        img = cv2.imread(str(src_img_path))
+        if img is None:
+            return
+
+        for d in detections:
+            x,y,w,h = d['bbox']
+            s = d['score']
+            color = (0,255,0) if s>=0.8 else (0,255,255) if s>=0.6 else (0,165,255)
+            cv2.rectangle(img, (x,y), (x+w, y+h), color, 2)
+            cv2.putText(img, f"{s:.2f}", (x, max(0,y-6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out_path), img)
+
+    # ----------------------------------------------------------------------
+    # Processamento do dataset
+    # ----------------------------------------------------------------------
+    def process_dataset(self, dataset_root: Path, visualize_samples: int = VIS_SAMPLES_PER_SPLIT):
+        """
+        Processa os splits train/val/test do dataset e gera:
+         - Arquivos YOLO em /labels/<split>/
+         - Amostras visuais
+         - Relatório estatístico das detecções
+
+        Caso já existam labels, cria-se automaticamente um backup.
+        """
+        dataset_root = Path(dataset_root)
+        if not dataset_root.exists():
+            raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
+
+        labels_dir = dataset_root / 'labels'
+        if labels_dir.exists():
+            backup_dir = dataset_root / f"labels_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            shutil.copytree(labels_dir, backup_dir)
+
+        report = {
+            'total_images': 0,
+            'images_with_detections': 0,
+            'total_detections': 0,
+            'by_split': {}
+        }
+
+        vis_dir = dataset_root / 'auto_labels_v3_visual'
+        vis_dir.mkdir(exist_ok=True)
+
+        for split in ['train','val','test']:
+
+            imgs = list((dataset_root/'images'/split).glob('*.jpg')) \
+                 + list((dataset_root/'images'/split).glob('*.png'))
+
+            (dataset_root/'labels'/split).mkdir(parents=True, exist_ok=True)
+
+            split_stats = {'images': len(imgs),
+                           'detections': 0,
+                           'images_with_detections': 0}
+            sample_vis = 0
+
+            print(f"\nProcessing {split}: {len(imgs)} images")
+
+            for img_path in tqdm(imgs, desc=f"{split}"):
+
+                report['total_images'] += 1
+
+                dets = self.detect_on_image(img_path)
+                img = cv2.imread(str(img_path))
+                if img is None:
                     continue
-                # manter apenas se for a classe alvo original
-                if cls == target_orig_class:
-                    new_lines.append("0 " + " ".join(parts[1:]))
-            if new_lines:
-                txt_path.write_text("\n".join(new_lines), encoding="utf-8")
-                kept += 1
-                # garantir que a imagem correspondente exista; se sim, manter/confirmar
-                img_jpg = img_dir / (txt_path.stem + ".jpg")
-                img_png = img_dir / (txt_path.stem + ".png")
-                if not (img_jpg.exists() or img_png.exists()):
-                    print("Atenção: label existe mas imagem não encontrada:", txt_path)
-            else:
-                # NÃO apagar labels! Apenas ignorar se quiser.
-                # Mantemos o arquivo vazio, pois o YOLO aceita normalmente.
-                txt_path.write_text("", encoding="utf-8")
-                removed += 1
+
+                h,w = img.shape[:2]
+                yolo_lines = self.to_yolo_lines(dets, w, h)
+
+                label_file = dataset_root/'labels'/split/f"{img_path.stem}.txt"
+                label_file.write_text("\n".join(yolo_lines), encoding='utf-8')
+
+                if dets:
+                    report['images_with_detections'] += 1
+                    split_stats['images_with_detections'] += 1
+
+                report['total_detections'] += len(dets)
+                split_stats['detections'] += len(dets)
+
+                if sample_vis < visualize_samples and dets:
+                    self.visualize(img_path, dets, vis_dir / f"{split}_{img_path.name}")
+                    sample_vis += 1
+
+            report['by_split'][split] = split_stats
+
+        report_file = dataset_root / f'auto_label_v3_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+        report_file.write_text(json.dumps(report, indent=2))
+
+        print("\nAuto-labeling complete. Report:", report_file)
+        return report
 
 
-    print(f"Conversão concluída. Mantidos: {kept} labels; removidos: {removed} labels.")
-
-
-def verify_and_prepare_dataset(yaml_path: Path):
-    """
-    Verifica estrutura do dataset a partir do YAML, cria val split se necessário,
-    converte labels para single-class se necessárias.
-    Retorna path raiz do dataset (campo 'path' do YAML).
-    """
-
-    if not yaml_path.exists():
-        raise FileNotFoundError(f"Arquivo YAML não encontrado: {yaml_path}")
-
-    cfg = read_yaml(yaml_path)
-    root = Path(cfg.get("path", ".")).resolve()
-
-    # normalizar strings (pode ser relativo ao yaml 'path')
-    train_images = root / cfg.get("train", "images/train")
-    val_images = root / cfg.get("val", "images/val")
-    test_images = root / cfg.get("test", "images/test")
-
-    train_labels = root / "labels/train"    
-    val_labels   = root / "labels/val"        
-    test_labels  = root / "labels/test"       
-
-
-    # se val_labels não existir ou estiver vazio, faremos um split automático
-    val_has_labels = val_labels.exists() and any(val_labels.rglob("*.txt"))
-    train_has_labels = train_labels.exists() and any(train_labels.rglob("*.txt"))
-
-    print("Dataset root:", root)
-    print("Train images:", train_images)
-    print("Val images:", val_images)
-    print("Train labels:", train_labels)
-    print("Val labels:", val_labels)
-
-    # Convert labels to single class if necessary (detect if there are non-zero classes)
-    # Check a sample of labels to detect classes present
-    classes_found = set()
-    if train_labels.exists():
-        for i, txt in enumerate(train_labels.rglob("*.txt")):
-            if i >= 200:  # sample limit
-                break
-            try:
-                for L in txt.read_text(encoding="utf-8").splitlines():
-                    parts = L.strip().split()
-                    if parts:
-                        classes_found.add(int(parts[0]))
-            except Exception:
-                continue
-
-    print("Classes encontradas nas labels (amostra):", classes_found)
-
-    if classes_found and (classes_found != {0}):
-        # converter automaticamente mantendo backup
-        convert_labels_to_single_class(root, TARGET_ORIG_CLASS)
-
-    # Re-check validation labels
-    val_has_labels = val_labels.exists() and any(val_labels.rglob("*.txt"))
-    train_has_labels = train_labels.exists() and any(train_labels.rglob("*.txt"))
-    # If val has no labels but train has, create val split from train (10%)
-    if (not val_has_labels) and train_has_labels:
-        print("Val set sem labels detectados — criando split automático (10% do train) para val).")
-        # gather all train images that have labels
-        train_label_files = list(train_labels.rglob("*.txt"))
-        random.seed(42)
-        random.shuffle(train_label_files)
-        n_val = max(1, int(0.10 * len(train_label_files)))
-        val_selection = train_label_files[:n_val]
-        for txt in val_selection:
-            # move txt and corresponding image to val folders
-            rel = txt.relative_to(train_labels)
-            target_txt = val_labels / rel
-            target_txt.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(txt), str(target_txt))
-
-            # move image
-            img_jpg = (train_images / rel.with_suffix(".jpg").name)
-            img_png = (train_images / rel.with_suffix(".png").name)
-            if img_jpg.exists():
-                (val_images / img_jpg.name).parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(img_jpg), str(val_images / img_jpg.name))
-            elif img_png.exists():
-                (val_images / img_png.name).parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(img_png), str(val_images / img_png.name))
-
-        print(f"Movidos {n_val} amostras do train -> val para validação.")
-
-    # final quick checks
-    n_train_imgs = sum(1 for _ in (train_images.rglob("*.jpg")))
-    n_train_labels = sum(1 for _ in (train_labels.rglob("*.txt")))
-    print(f"Train images: {n_train_imgs:,}, train labels: {n_train_labels:,}")
-    if n_train_labels == 0:
-        raise RuntimeError("Nenhuma label encontrada no train após preparação — verifique o dataset.")
-
-    return root
-
-
-def try_train_with_retries(model: YOLO, train_args: dict, max_retries=MAX_RETRIES_ON_OOM):
-    """Tenta treinar e, em caso de OOM CUDA, reduz batch e tenta novamente."""
-    attempt = 0
-    while attempt <= max_retries:
-        try:
-            torch.cuda.empty_cache()
-            print(f"\nIniciando tentativa de treino (tentativa {attempt+1})...")
-            results = model.train(**train_args)
-            return results
-        except RuntimeError as e:
-            msg = str(e).lower()
-            if "out of memory" in msg or "cuda error" in msg:
-                attempt += 1
-                # reduzir batch para tentar recuperar
-                if "batch" in train_args and train_args["batch"] > 1:
-                    old = train_args["batch"]
-                    train_args["batch"] = max(1, int(old // 2))
-                    print(f"OOM detectado: reduzindo batch de {old} -> {train_args['batch']} e reiniciando...")
-                    torch.cuda.empty_cache()
-                    time.sleep(3)
-                    continue
-                else:
-                    raise
-            else:
-                # re-raise for other exceptions
-                raise
-
-
-def build_train_args(yaml_path: Path, model_version=DEFAULT_MODEL, project=DEFAULT_PROJECT):
-    """Constrói dicionário de argumentos para model.train() com boas práticas para whitefly"""
-    args = dict(
-        data=str(yaml_path),
-
-        # --- Ajustes para caber na GTX 1650 ---
-        imgsz=512,           # 640 é muito alto para 4GB; 512 é ideal
-        batch=4,             # valor realista (4 → pode falhar, 2 é seguro)
-        workers=1,           # Windows + VRAM baixa = 1 worker é mais estável
-
-        epochs=200,
-        cache="disk",
-        patience=60,
-        device=0 if torch.cuda.is_available() else "cpu",
-        project=project,
-        name=f"whitefly_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-
-        # --- Treino estável ---
-        optimizer="AdamW",
-        lr0=0.001,
-        amp=False,           # IMPORTANTÍSSIMO: 1650 gera NaN com AMP
-        half=False,          # FP16 causa instabilidade em GPUs 4GB
-        single_cls=True,
-
-        # --- Augmentations balanceadas ---
-        multi_scale=True,        # ✅ Escalas variadas
-        mosaic=0.5,              # ✅ Contexto rico
-        close_mosaic=150,        # ✅ ADICIONE - Ajuste fino no final
-        mixup=0.0,               # ✅ OK por enquanto
-        auto_augment=None,       # ✅ Mantém controle manual
-
-        # --- Mantém leves ---
-        degrees=10.0,
-        translate=0.1,
-        scale=0.5,
-        shear=0.0,
-        perspective=0.0,
-        fliplr=0.5,
-        erasing=0.1,
-
-        # --- HSV otimizado ---
-        hsv_h=0.017,
-        hsv_s=0.5,
-        hsv_v=0.4,
-
-        # --- Outros ---
-        overlap_mask=True,
-        save_period=-1,
-        verbose=True,
-        plots=False
-    )
-    # set model path
-    args["model"] = f"{model_version}.pt"
-    return args
-def convert_labels_to_single_class(dataset_root: Path, target_orig_class: int = TARGET_ORIG_CLASS):
-    images_root = dataset_root / "images"
-    labels_root = dataset_root / "labels"
-
-    print("Convertendo labels para classe única (0 = whitefly).")
-    ensure_label_backup(dataset_root)
-
-    kept = 0
-    removed = 0
-
-    for split in ("train", "val", "test"):
-        lbl_dir = labels_root / split
-        img_dir = images_root / split
-
-        if not lbl_dir.exists():
-            continue
-
-        for txt_path in list(lbl_dir.rglob("*.txt")):
-            try:
-                lines = txt_path.read_text(encoding="utf-8").splitlines()
-            except:
-                lines = []
-
-            new_lines = []
-            for L in lines:
-                parts = L.strip().split()
-                if len(parts) >= 5:
-                    try:
-                        cls = int(parts[0])
-                    except:
-                        continue
-
-                    if cls == target_orig_class:
-                        new_lines.append("0 " + " ".join(parts[1:]))
-
-            if new_lines:
-                txt_path.write_text("\n".join(new_lines), encoding="utf-8")
-                kept += 1
-            else:
-                # NÃO deletar! Apenas manter vazio.
-                txt_path.write_text("", encoding="utf-8")
-                removed += 1
-
-    print(f"Conversão concluída. Mantidos: {kept}, esvaziados: {removed}.")
-
-
-def main():
-    print("\n=== Iniciando preparação e treino (whitefly) ===\n")
-
-    # Confirmar YAML (mantendo caminho como o usuário pediu)
-    yaml_path = DATASET_YAML_PATH
-    if not yaml_path.exists():
-        print("Erro: YAML não encontrado:", yaml_path)
-        sys.exit(1)
-
-    # Preparar dataset: checar/convert labels e garantir val
-    dataset_root = verify_and_prepare_dataset(yaml_path)
-
-    # Converter (se necessário) — função internamente faz backup
-    # (a conversão já é chamada dentro verify_and_prepare_dataset quando detecta classes != {0})
-    print("\nDataset preparado em:", dataset_root)
-
-    # Carregar modelo
-    model_version = DEFAULT_MODEL
-    model = YOLO(f"{model_version}.pt")
-    print("Modelo carregado:", model_version)
-
-    # montar args de treino
-    train_args = build_train_args(yaml_path, model_version=model_version, project=DEFAULT_PROJECT)
-
-    # map para ultralytics: 'model' deve ser passado via método se não usar model.train(model=..), porém o método YOLO(...).train já usa pesos do objeto
-    # aqui chamaremos try_train_with_retries com o objeto 'model' e args
-    # Remover 'model' do args pois usamos model.train()
-    if "model" in train_args:
-        train_args.pop("model")
-
-    # limpar VRAM antes de começar
-    torch.cuda.empty_cache()
-
-    try:
-        results = try_train_with_retries(model, train_args, max_retries=MAX_RETRIES_ON_OOM)
-    except Exception as e:
-        print("Erro durante o treinamento:", e)
-        raise
-
-    print("\nTreinamento finalizado. Resultado salvo em:", results)
-    # validação final automática
-    try:
-        print("\nExecutando validação final (self.model.val)...")
-        model.val(plots=True)
-    except Exception as e:
-        print("Validação final falhou:", e)
-
-    # limpar VRAM no final
-    torch.cuda.empty_cache()
-    print("\n=== Processo concluído ===\n")
-
-
+# ------------------------------------------------------------
+# Execução direta pela linha de comando
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Whitefly Auto-Labeler V3")
+    parser.add_argument("--dataset", type=str, required=False,
+                        default=r"C:\Users\Victor\Documents\TCC\IA\datasets\ip102_yolo_white_fly",
+                        help="dataset root (images/, labels/)")
+    parser.add_argument("--conf", type=float, default=DEFAULT_CONFIDENCE,
+                        help="confidence threshold")
+    parser.add_argument("--vis", type=int, default=VIS_SAMPLES_PER_SPLIT,
+                        help="visual samples per split")
+    parser.add_argument("--debug", action='store_true', help="debug prints")
+    args = parser.parse_args()
+
+    root = Path(args.dataset)
+    if not root.exists():
+        print("Dataset not found:", root)
+        exit(1)
+
+    labeler = WhiteflyAutoLabelerV3(confidence_threshold=args.conf,
+                                    debug=args.debug)
+    report = labeler.process_dataset(root, visualize_samples=args.vis)
+
+    print("\nSummary:")
+    print(json.dumps(report, indent=2))
+    print("\nDone.")
