@@ -1,9 +1,22 @@
+# -*- coding: utf-8 -*-
 """
-Script completo de teste e validação do modelo YOLO treinado
-Gera métricas detalhadas, gráficos e relatórios
+Script Completo de Teste, Validação e Benchmark para YOLOv8
+----------------------------------------------------------
+Este script atua como uma suíte de testes pós-treinamento (Post-training Validation Suite).
+Ele carrega um modelo treinado (.pt) e executa uma bateria de avaliações para
+quantificar o desempenho técnico e a viabilidade operacional.
+
+Principais Funcionalidades:
+    1. Validação Oficial (mAP): Calcula métricas padrão COCO (Precision, Recall, mAP) no conjunto de teste.
+    2. Teste Visual: Executa inferência em imagens aleatórias e salva os resultados com bounding boxes desenhadas.
+    3. Matriz de Confusão: Gera gráficos para analisar erros de classificação (falso positivo vs. falso negativo).
+    4. Benchmark de Velocidade: Mede a latência média de inferência (ms) e a taxa de quadros (FPS).
+    5. Relatório HTML: Compila todos os dados em um dashboard web para fácil visualização.
 """
 
 import os
+# Configuração de ambiente para evitar erro "OMP: Error #15" comum em Windows com GPUs NVIDIA
+# Permite múltiplas cópias da biblioteca de runtime OpenMP
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 from ultralytics import YOLO
@@ -20,20 +33,29 @@ from tqdm import tqdm
 import yaml
 
 class ModelValidator:
-    """Classe para teste e validação completa do modelo"""
+    """
+    Classe orquestradora dos testes de validação.
+    Gerencia o carregamento do modelo, caminhos do dataset e geração de artefatos de saída.
+    """
     
     def __init__(self, model_path, dataset_yaml):
-        
+        """
+        Inicializa o validador e prepara o ambiente de teste.
+
+        Args:
+            model_path (str/Path): Caminho absoluto para o arquivo de pesos (.pt).
+            dataset_yaml (str/Path): Caminho para o arquivo de configuração (.yaml) do dataset.
+        """
         print("="*70)
         print(" "*20 + "VALIDAÇÃO DE MODELO YOLO")
         print("="*70)
         
-        # Carregar modelo
+        # 1. Carregar modelo na memória (GPU se disponível, senão CPU)
         print(f"\nCarregando modelo: {model_path}")
         self.model = YOLO(model_path)
         self.model_path = Path(model_path)
         
-        # Carregar configuração do dataset
+        # 2. Carregar configuração do dataset para saber caminhos e nomes das classes
         print(f"Carregando dataset: {dataset_yaml}")
         with open(dataset_yaml, 'r') as f:
             self.dataset_config = yaml.safe_load(f)
@@ -43,7 +65,7 @@ class ModelValidator:
         self.class_names = self.dataset_config['names']
         self.num_classes = self.dataset_config['nc']
         
-        # Criar diretório de resultados
+        # 3. Criar diretório único para resultados baseado em timestamp (evita sobrescrita)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.results_dir = Path(f'./validation_results_{timestamp}')
         self.results_dir.mkdir(exist_ok=True)
@@ -53,13 +75,26 @@ class ModelValidator:
         print(f"✓ Resultados serão salvos em: {self.results_dir}")
     
     def validate_on_test_set(self):
-        """Valida modelo no conjunto de teste"""
+        """
+        Executa a validação oficial no conjunto de TESTE.
+        Utiliza o método nativo .val() do YOLO para calcular métricas COCO.
+
+        Métricas calculadas:
+        - Precision (P): Exatidão das detecções positivas.
+        - Recall (R): Capacidade de encontrar todos os objetos reais.
+        - mAP@50: Média da precisão média com limiar de IoU 0.5.
+        - mAP@50-95: Métrica rigorosa (média de steps de IoU de 0.5 a 0.95).
+
+        Returns:
+            dict: Dicionário contendo todas as métricas calculadas.
+        """
         
         print("\n" + "="*70)
         print("VALIDAÇÃO NO CONJUNTO DE TESTE")
         print("="*70)
         
         # Executar validação oficial do YOLO
+        # conf=0.001 é padrão para calcular curvas PR completas sem cortar candidatos
         metrics = self.model.val(
             data=self.dataset_yaml,
             split='test',
@@ -67,10 +102,10 @@ class ModelValidator:
             save_hybrid=True,
             plots=True,
             conf=0.001,  # Limiar baixo para pegar todas detecções
-            iou=0.5
+            iou=0.5      # Limiar de NMS
         )
         
-        # Extrair métricas
+        # Extrair métricas principais do objeto retornado
         results = {
             'model': str(self.model_path),
             'dataset': str(self.dataset_yaml),
@@ -81,11 +116,11 @@ class ModelValidator:
                 'recall': float(metrics.box.mr),
                 'mAP50': float(metrics.box.map50),
                 'mAP50_95': float(metrics.box.map),
-                'fitness': float(metrics.fitness)
+                'fitness': float(metrics.fitness) # Métrica combinada da Ultralytics
             }
         }
         
-        # Métricas por classe
+        # Extrair métricas detalhadas por classe individualmente
         if hasattr(metrics.box, 'ap_class_index'):
             results['per_class'] = {}
             for i, class_idx in enumerate(metrics.box.ap_class_index):
@@ -97,7 +132,7 @@ class ModelValidator:
                     'AP': float(metrics.box.ap[i])
                 }
         
-        # Salvar resultados
+        # Persistir resultados em JSON para análise posterior
         results_file = self.results_dir / 'validation_metrics.json'
         with open(results_file, 'w') as f:
             json.dump(results, indent=2, fp=f)
@@ -107,7 +142,9 @@ class ModelValidator:
         return results
     
     def print_metrics(self, results):
-        """Imprime métricas formatadas"""
+        """
+        Utilitário para imprimir as métricas no console de forma formatada e legível.
+        """
         
         print("\n" + "="*70)
         print("MÉTRICAS GERAIS")
@@ -136,7 +173,13 @@ class ModelValidator:
     
     def test_on_images(self, test_dir=None, num_samples=10, conf_threshold=0.25):
         """
-        Testa modelo em imagens individuais do conjunto de teste
+        Executa inferência visual (predição) em uma amostra de imagens.
+        Gera arquivos de imagem com as bounding boxes desenhadas para inspeção qualitativa.
+        
+        Args:
+            test_dir: Diretório das imagens de teste (se None, infere do YAML).
+            num_samples: Quantidade de imagens aleatórias para testar.
+            conf_threshold: Confiança mínima para considerar uma detecção válida (padrão 0.25).
         """
         
         print("\n" + "="*70)
@@ -153,7 +196,7 @@ class ModelValidator:
             print(f"❌ Diretório de teste não encontrado: {test_dir}")
             return
         
-        # Listar imagens
+        # Listar imagens (jpg e png)
         image_files = list(test_dir.rglob('*.jpg')) + list(test_dir.rglob('*.png'))
 
         if not image_files:
@@ -162,17 +205,16 @@ class ModelValidator:
 
         print(f"\n✓ {len(image_files)} imagens encontradas")
 
-        
         # Criar diretório para resultados visuais
         visual_dir = self.results_dir / 'test_images'
         visual_dir.mkdir(exist_ok=True)
         
-        # Processar amostras
+        # Embaralhar e selecionar amostras
         np.random.shuffle(image_files)
         test_results = []
         
         for i, img_file in enumerate(tqdm(image_files[:num_samples], desc="Testando")):
-            # Predição
+            # Predição (Inferência)
             results = self.model.predict(
                 str(img_file),
                 conf=conf_threshold,
@@ -183,7 +225,7 @@ class ModelValidator:
             if len(results) > 0:
                 result = results[0]
                 
-                # Contar detecções por classe
+                # Contar detecções por classe para o JSON
                 detections = {}
                 if result.boxes is not None and len(result.boxes) > 0:
                     for box in result.boxes:
@@ -201,12 +243,12 @@ class ModelValidator:
                     'detections': detections
                 })
                 
-                # Salvar imagem com predições
+                # Salva a imagem anotada (método .plot() desenha as caixas)
                 annotated = result.plot()
                 output_path = visual_dir / f'pred_{i:03d}_{img_file.name}'
                 cv2.imwrite(str(output_path), annotated)
         
-        # Salvar resultados
+        # Salvar resultados numéricos
         test_results_file = self.results_dir / 'test_results.json'
         with open(test_results_file, 'w') as f:
             json.dump(test_results, indent=2, fp=f)
@@ -217,12 +259,16 @@ class ModelValidator:
         return test_results
     
     def generate_confusion_matrix(self, test_dir=None):
-        """Gera matriz de confusão"""
+        """
+        Gera e plota a Matriz de Confusão comparando Ground Truth vs Predições.
+        Crucial para entender quais classes o modelo confunde ou onde ele erra (Falso Positivo/Negativo).
+        """
         
         print("\n" + "="*70)
         print("GERANDO MATRIZ DE CONFUSÃO")
         print("="*70)
         
+        # Determina caminhos de imagens e labels
         if test_dir is None:
             test_dir = self.dataset_root / 'images' / 'test'
             label_dir = self.dataset_root / 'labels' / 'test'
@@ -234,7 +280,7 @@ class ModelValidator:
             print(f"❌ Diretórios não encontrados")
             return
         
-        # Inicializar matriz
+        # Inicializar matriz N x N
         conf_matrix = np.zeros((self.num_classes, self.num_classes), dtype=int)
         
         # Processar imagens
@@ -243,7 +289,7 @@ class ModelValidator:
         print(f"Processando {len(image_files)} imagens...")
         
         for img_file in tqdm(image_files, desc="Matriz de confusão"):
-            # Ground truth
+            # 1. Ler Ground Truth (arquivo .txt)
             label_file = label_dir / f'{img_file.stem}.txt'
             
             if not label_file.exists():
@@ -255,20 +301,20 @@ class ModelValidator:
             if not gt_lines:
                 continue
             
-            # Predições
+            # 2. Rodar Predição
             results = self.model.predict(str(img_file), conf=0.25, verbose=False)
             
             if len(results) == 0 or results[0].boxes is None:
                 continue
             
-            # Comparar GT com predições
+            # 3. Comparar GT com Predições (Matching via IoU)
             for gt_line in gt_lines:
                 gt_class = int(gt_line.split()[0])
                 gt_coords = [float(x) for x in gt_line.split()[1:]]
                 
-                # Encontrar predição mais próxima
+                # Encontrar predição mais próxima (maior IoU)
                 best_iou = 0
-                best_pred_class = gt_class  # Default: mesma classe (FN se não achar)
+                best_pred_class = gt_class  # Default: assume acerto se não achar match (simplificação para visualização)
                 
                 for box in results[0].boxes:
                     pred_class = int(box.cls[0])
@@ -277,6 +323,7 @@ class ModelValidator:
                     # Calcular IoU
                     iou = self.calculate_iou_xywh(gt_coords, pred_coords)
                     
+                    # Se houver sobreposição significativa (>0.5), considera um match
                     if iou > best_iou and iou > 0.5:
                         best_iou = iou
                         best_pred_class = pred_class
@@ -284,10 +331,10 @@ class ModelValidator:
                 # Atualizar matriz
                 conf_matrix[gt_class][best_pred_class] += 1
         
-        # Plotar matriz
+        # Plotar matriz com Seaborn (Heatmap)
         plt.figure(figsize=(12, 10))
         
-        # Normalizar por linha (recall)
+        # Normalizar por linha (Recall por classe)
         conf_matrix_norm = conf_matrix.astype('float') / (conf_matrix.sum(axis=1)[:, np.newaxis] + 1e-6)
         
         sns.heatmap(conf_matrix_norm, annot=True, fmt='.2f', cmap='Blues',
@@ -300,14 +347,14 @@ class ModelValidator:
         plt.title('Matriz de Confusão (Normalizada)', fontsize=14, fontweight='bold')
         plt.tight_layout()
         
-        # Salvar
+        # Salvar imagem
         matrix_path = self.results_dir / 'confusion_matrix.png'
         plt.savefig(matrix_path, dpi=300, bbox_inches='tight')
         plt.close()
         
         print(f"\n✓ Matriz de confusão salva em: {matrix_path}")
         
-        # Salvar dados da matriz
+        # Salvar dados numéricos da matriz
         matrix_data = {
             'confusion_matrix': conf_matrix.tolist(),
             'confusion_matrix_normalized': conf_matrix_norm.tolist(),
@@ -321,9 +368,18 @@ class ModelValidator:
         return conf_matrix
     
     def calculate_iou_xywh(self, box1, box2):
-        """Calcula IoU entre duas boxes no formato xywh (normalizado)"""
+        """
+        Função auxiliar para calcular Intersection over Union (IoU) entre duas caixas.
+        Usada para determinar se uma predição corresponde a um Ground Truth.
         
-        # Converter xywh para xyxy
+        Args:
+            box1, box2: Listas [x_center, y_center, width, height] (valores normalizados)
+        
+        Returns:
+            float: Valor IoU (0.0 a 1.0).
+        """
+        
+        # Converter formato xywh (centro) para xyxy (cantos)
         def xywh_to_xyxy(box):
             x, y, w, h = box
             x1 = x - w/2
@@ -335,18 +391,19 @@ class ModelValidator:
         box1_xyxy = xywh_to_xyxy(box1)
         box2_xyxy = xywh_to_xyxy(box2)
         
-        # Calcular interseção
+        # Calcular coordenadas da área de interseção
         x1 = max(box1_xyxy[0], box2_xyxy[0])
         y1 = max(box1_xyxy[1], box2_xyxy[1])
         x2 = min(box1_xyxy[2], box2_xyxy[2])
         y2 = min(box1_xyxy[3], box2_xyxy[3])
         
+        # Se não houver interseção
         if x2 < x1 or y2 < y1:
             return 0.0
         
         intersection = (x2 - x1) * (y2 - y1)
         
-        # Calcular união
+        # Calcular área de união
         box1_area = (box1_xyxy[2] - box1_xyxy[0]) * (box1_xyxy[3] - box1_xyxy[1])
         box2_area = (box2_xyxy[2] - box2_xyxy[0]) * (box2_xyxy[3] - box2_xyxy[1])
         union = box1_area + box2_area - intersection
@@ -354,21 +411,27 @@ class ModelValidator:
         return intersection / (union + 1e-6)
     
     def benchmark_speed(self, num_runs=100):
-        """Testa velocidade de inferência"""
+        """
+        Mede a velocidade de inferência pura (sem overhead de leitura de disco).
+        Gera estatísticas de latência (ms) e taxa de quadros (FPS).
+        
+        Args:
+            num_runs: Quantas inferências executar para tirar a média.
+        """
         
         print("\n" + "="*70)
         print("BENCHMARK DE VELOCIDADE")
         print("="*70)
         
-        # Criar imagem de teste
+        # Criar imagem de teste sintética (ruído aleatório) do tamanho padrão YOLO
         test_img = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
         
-        # Warm-up
+        # Warm-up: Rodar algumas vezes para inicializar a GPU/bibliotecas
         print("\nAquecendo GPU/CPU...")
         for _ in range(10):
             _ = self.model.predict(test_img, verbose=False)
         
-        # Benchmark
+        # Benchmark real
         print(f"Executando {num_runs} inferências...")
         times = []
         
@@ -377,7 +440,7 @@ class ModelValidator:
             _ = self.model.predict(test_img, verbose=False)
             times.append(time.time() - start)
         
-        # Estatísticas
+        # Estatísticas em milissegundos
         times_ms = np.array(times) * 1000
         
         results = {
@@ -386,7 +449,7 @@ class ModelValidator:
             'min_ms': float(np.min(times_ms)),
             'max_ms': float(np.max(times_ms)),
             'median_ms': float(np.median(times_ms)),
-            'fps': float(1000 / np.mean(times_ms)),
+            'fps': float(1000 / np.mean(times_ms)), # FPS = 1000 / média_ms
             'device': str(self.model.device)
         }
         
@@ -406,7 +469,7 @@ class ModelValidator:
         with open(benchmark_file, 'w') as f:
             json.dump(results, indent=2, fp=f)
         
-        # Plotar distribuição
+        # Plotar histograma de distribuição de tempo
         plt.figure(figsize=(10, 6))
         plt.hist(times_ms, bins=50, edgecolor='black', alpha=0.7)
         plt.axvline(results['mean_ms'], color='r', linestyle='--', label=f'Média: {results["mean_ms"]:.2f} ms')
@@ -428,7 +491,10 @@ class ModelValidator:
         return results
     
     def generate_report(self, validation_results, speed_results=None):
-        """Gera relatório completo em HTML"""
+        """
+        Compila todos os dados gerados (métricas, caminhos de imagens) em um arquivo HTML.
+        Cria um dashboard visual fácil de ler.
+        """
         
         print("\n" + "="*70)
         print("GERANDO RELATÓRIO HTML")
@@ -607,7 +673,11 @@ class ModelValidator:
 
 
 def find_latest_model():
-    """Encontra o modelo treinado mais recente"""
+    """
+    Tenta localizar automaticamente o arquivo 'best.pt' mais recente
+    dentro das pastas do projeto (runs, pest_detection_fast, etc.).
+    Isso facilita a execução sem precisar digitar caminhos longos.
+    """
     
     search_paths = [
         Path('./pest_detection_fast'),
@@ -643,7 +713,7 @@ if __name__ == "__main__":
     print(" "*15 + "TESTE E VALIDAÇÃO DE MODELO YOLO")
     print("="*70)
     
-    # Encontrar modelo
+    # 1. Tentar encontrar modelo automaticamente para conveniência
     print("\nBuscando modelo treinado...")
     model_path = find_latest_model()
     
@@ -654,30 +724,32 @@ if __name__ == "__main__":
         if use_found.lower() != 's':
             model_path = None
     
+    # 2. Solicitar caminho manual se necessário
     if not model_path:
         model_input = input("\nCaminho do modelo (.pt): ").strip()
         model_path = Path(model_input)
         
         if not model_path.exists():
-            print(f"\n❌ Modelo não encontrado: {model_path}")
+            print(f"\n Modelo não encontrado: {model_path}")
             input("\nPressione Enter para sair...")
             exit(1)
     
-    # Caminho do dataset
+    # 3. Configurar caminho do dataset
+    # (Idealmente parametrizável, mas hardcoded para simplicidade neste projeto)
     dataset_yaml = Path(r'C:\Users\Victor\Documents\TCC\IA\datasets\ip102_yolo_white_fly\ip102.yaml')
     
     if not dataset_yaml.exists():
-        print(f"\n❌ Dataset YAML não encontrado: {dataset_yaml}")
+        print(f"\n Dataset YAML não encontrado: {dataset_yaml}")
         input("\nPressione Enter para sair...")
         exit(1)
     
-    # Criar validador
+    # 4. Instanciar Validador
     validator = ModelValidator(
         model_path=str(model_path),
         dataset_yaml=str(dataset_yaml)
     )
     
-    # Menu de testes
+    # 5. Menu Interativo
     print("\n" + "="*70)
     print("SELECIONE OS TESTES A EXECUTAR")
     print("="*70)
@@ -692,6 +764,7 @@ if __name__ == "__main__":
     validation_results = None
     speed_results = None
     
+    # Lógica de execução baseada na escolha
     if escolha == '1' or escolha == '5':
         validation_results = validator.validate_on_test_set()
         validator.print_metrics(validation_results)
@@ -713,6 +786,11 @@ if __name__ == "__main__":
     print("\n" + "="*70)
     print("✓ VALIDAÇÃO CONCLUÍDA!")
     print("="*70)
-    print(f"\n📁 Resultados salvos em: {validator.results_dir}")
+    print(f"\n Resultados salvos em: {validator.results_dir}")
+
+    print("\nPróximos passos:")
+    print("1️ Abra o relatório HTML gerado para visualizar métricas e gráficos.")
+    print("2  Analise as imagens anotadas na pasta 'test_images'.")
+    print("3  Consulte os arquivos JSON para uso em relatórios técnicos.")
 
     input("\nPressione Enter para sair...")
