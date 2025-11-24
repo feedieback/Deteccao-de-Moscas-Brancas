@@ -133,11 +133,5 @@ python test_validation_model.py
 
 -----
 
-## 📝 Referências
-
-  * **YOLOv8:** Jocher, G., Chaurasia, A., & Qiu, J. (2023). Ultralytics YOLO.
-  * **Dataset IP102:** Wu, X., et al. (2019). IP102: A Large-Scale Benchmark Dataset for Insect Pest Recognition. CVPR.
-
------
 **Autor:** Victor Augusto de Oliveira
 *Engenharia de Computação - FHO*
