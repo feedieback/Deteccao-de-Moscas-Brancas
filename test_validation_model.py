@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Script completo de teste e validação do modelo YOLO treinado
 Gera métricas detalhadas, gráficos e relatórios
@@ -24,11 +23,7 @@ class ModelValidator:
     """Classe para teste e validação completa do modelo"""
     
     def __init__(self, model_path, dataset_yaml):
-        """
-        Args:
-            model_path: C:/Users/Victor/Documents/TCC/IA/pest_detection_ip102/train_yolov8n/weights/best.pt
-            dataset_yaml: C:/Users/Victor/Documents/TCC/IA/datasets/ip102_yolo/ip102.yaml
-        """
+        
         print("="*70)
         print(" "*20 + "VALIDAÇÃO DE MODELO YOLO")
         print("="*70)
@@ -142,11 +137,6 @@ class ModelValidator:
     def test_on_images(self, test_dir=None, num_samples=10, conf_threshold=0.25):
         """
         Testa modelo em imagens individuais do conjunto de teste
-        
-        Args:
-            test_dir: C:/Users/Victor/Documents/TCC/IA/datasets/ip102_yolo/images/test
-            num_samples: 100
-            conf_threshold: 0.25
         """
         
         print("\n" + "="*70)
@@ -724,10 +714,5 @@ if __name__ == "__main__":
     print("✓ VALIDAÇÃO CONCLUÍDA!")
     print("="*70)
     print(f"\n📁 Resultados salvos em: {validator.results_dir}")
-
-    print("\nPróximos passos:")
-    print("1️⃣  Abra o relatório HTML gerado para visualizar métricas e gráficos.")
-    print("2️⃣  Analise as imagens anotadas na pasta 'test_images'.")
-    print("3️⃣  Consulte os arquivos JSON para uso em relatórios técnicos.")
 
     input("\nPressione Enter para sair...")
